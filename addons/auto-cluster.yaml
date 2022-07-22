@@ -1,0 +1,68 @@
+type: update
+id: postgres-primary-secondary-multiregion-auto-cluster
+logo: /images/postgres-70x70.png
+name: PostgreSQL Primary-Secondary Multiregion Auto-Cluster
+
+baseUrl: https://raw.githubusercontent.com/SiryjVyiko/postgres-multiregion/master
+
+targetNodes:
+  nodeGroup: sqldb
+
+onInstall:
+  - script: scripts/getEnvNodes.js
+  - setNodeDisplayName[sqldb]: Primary
+  - init
+
+actions:
+  init:
+    - if (${settings.clone:false} || ${this.update:false}):
+      - cmd[${nodes.sqldb.master.id}]: jcm removeAllReplicaHosts
+      - getPswd
+      - forEach(globals.pgsqlEnvs):
+          - if ('${@i}' != '${env.envName}'):
+            - script: ${baseUrl}/scripts/getSecondaryNodeParam.js
+            - script: |-
+                var addReplicaHostCmd = "jcm addReplicaHost" + '${response.secondaryNodeIp}' + " &>> /var/log/run.log; sudo jem service restart";
+                resp = jelastic.env.control.ExecCmdByGroup('${env.envName}', session, "sqldb", toJSON([{ "command": addReplicaHostCmd, "params": "" }]), false, false, "root");
+                if (resp.result != 0) return resp;
+                var updatePrimaryConnInfo = "jcm updatePrimaryConnInfo &>> /var/log/run.log; jcm updateHbaConf " + "${globals.pgsqlAddresses} " + '${response.secondaryNodeIp}' + " ; sudo jem service restart"
+                resp = jelastic.env.control.ExecCmdByGroup('${@i}', session, "sqldb", toJSON([{ "command": updatePrimaryConnInfo, "params": "" }]), false, false, "root");
+                if (resp.result != 0) return resp;
+                return { result:0 }
+    - else:
+      - setNodeDisplayName[${nodes.sqldb.master.id}]: Primary
+      - getPswd
+      - forEach(globals.pgsqlEnvs):
+          - if ('${@i}' != '${env.envName}'): 
+            - script: ${baseUrl}/scripts/getSecondaryNodeParam.js
+            - initSecondary: 
+                id: ${response.secondaryNodeId}
+                ip: ${response.secondaryNodeIp}
+                domain: ${@i}
+    - forEach(globals.pgsqlEnvs):
+        - if ('${@i}' != '${env.envName}'):
+          - script: |-
+              var resp = jelastic.marketplace.jps.Install({
+                  envName: '${@i}',
+                  session: session,
+                  jps: '${baseUrl}/scripts/manifest_secondary.yml',
+                  nodeGroup: 'sqldb'
+              });
+              if (resp.result != 0) return resp;
+              return { result:0 }
+              
+  initSecondary:
+    - cmd[${nodes.sqldb.master.id}]: |-
+        jcm addReplicaHost ${this.ip} &>> /var/log/run.log
+        sudo jem service reload
+    - script: |-
+        initSecondaryCmd = "jcm setPswd ${globals.password}; jcm initSecondary &>> /var/log/run.log; jcm updateHbaConf ${globals.pgsqlAddresses} ${this.ip}; chown -R postgres:postgres /var/lib/pgsql/data; jem service restart";
+        resp = jelastic.env.control.ExecCmdById('${this.domain}', session, ${this.id}, toJSON([{ "command": initSecondaryCmd, "params": "" }]), false, "root");
+        return resp;
+
+  getPswd:
+    - cmd[${nodes.sqldb.master.id}]: |-
+        jcm initMaster &>> /var/log/run.log
+        jcm getPswd
+    - setGlobals: 
+        password: ${response.out}

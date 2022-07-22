@@ -1,0 +1,128 @@
+type: install
+version: 1.7
+id: postgres-node
+name: PostgreSQL Node 
+
+baseUrl: https://raw.githubusercontent.com/SiryjVyiko/postgres-multiregion/master
+
+nodes:
+  cloudlets: 32
+  scalingMode: STATELESS
+  nodeType: ${settings.nodeType}
+  nodeGroup: sqldb
+  cluster: false
+  skipNodeEmails: true
+
+addons:
+  - id: clone-postgres-multiregional-cluster
+    name: Clone postgres multiregional cluster
+    description: Clone postgres multiregional cluster
+    baseUrl: https://raw.githubusercontent.com/SiryjVyiko/postgres-multiregion/master
+    buttons:
+      - confirmText: Do you want to clone all the environments of the Postgres multiregional cluster?
+        loadingText: Cloning the multiregional cluster...
+        action: cloneCluster
+        caption: Clone cluster
+        successText: "Multiregional Postgres cluster is successfully cloned"
+    actions:
+      cloneCluster:
+        - script: |-
+            var regions = '${globals.regions}'.split(',');
+            for (var cluster = 1, n = regions.length + 1; cluster < n; cluster++) {
+                var resp = jelastic.env.control.GetEnvInfo('${globals.mainEnvName}-' + cluster, session);
+                if (resp.result == 0) {
+                    var resp = jelastic.env.control.CloneEnv('${globals.mainEnvName}-' + cluster, session, '${globals.mainEnvName}-clone-' + cluster);
+                    if (resp.result != 0) return resp;
+                }
+            }
+            return { result: 0 };
+        - install: ${baseUrl}/addons/auto-cluster.yaml
+          envName: ${globals.mainEnvName}-clone-1
+          settings:
+            nodeGroup: sqldb
+            clone: true
+            regions: "${globals.regions}"
+            mainEnvName: "${globals.mainEnvName}-clone"
+
+
+onBeforeMigrate:
+  stopEvent:
+    type: warning
+    message: Migration is not supported for multiregion cluster.
+
+onBeforeRemoveNode[sqldb]:
+  stopEvent:
+    type: warning
+    message: Scaling is not supported for multiregion cluster.
+
+onBeforeAddNode[sqldb]:
+  stopEvent:
+    type: warning
+    message: Scaling is not supported for multiregion cluster.
+
+onAfterResetServicePassword[sqldb]:
+  - setPasswordAcrossRegions
+
+onAfterResetNodePassword[sqldb]:
+  - setPasswordAcrossRegions
+
+onInstall:
+  - cmd[${nodes.sqldb.master.id}]: jem passwd set -p ${settings.password}
+    user: root
+  - setGlobals:
+      regions: ${settings.regions}
+      mainEnvName: ${settings.mainEnvName}
+  - installAddon:
+    id: clone-postgres-multiregional-cluster
+    nodeGroup: sqldb
+    settings:
+      regions: ${settings.regions}
+      mainEnvName: ${settings.mainEnvName}
+
+onBeforeDelete:
+  - deleteEnvFromMultiregionalCluster
+
+actions:
+  setPasswordAcrossRegions:
+    - cmd[${nodes.sqldb.master.id}]: jcm getPswd
+    - setGlobals:
+        password: ${response.out}
+    - script: scripts/getEnvNodes.js
+    - forEach(globals.pgsqlEnvs):
+        - if ('${@i}' != '${env.envName}'):
+          - script: |-
+              var passwdCmd = "jcm setPswd ${globals.password}",
+              resp = jelastic.env.control.ExecCmdByGroup('${@i}', session, "sqldb", toJSON([{ "command": passwdCmd, "params": "" }]), false, false, "root");
+              return resp;
+
+  deleteEnvFromMultiregionalCluster:
+    - cmd[${nodes.sqldb.master.id}]: jcm getPswd
+    - setGlobals:
+        password: ${response.out}
+    - script: |-
+        var regions = '${settings.regions}'.split(','), onAfterReturn = { setGlobals: {} },
+            glbs = onAfterReturn.setGlobals,
+            pgsqlIPs = [];
+        for (var cluster = 1, n = regions.length + 1; cluster < n; cluster++) {
+            if ('${settings.mainEnvName}-' + cluster != 'env.envName') {
+                var resp = jelastic.env.control.GetEnvInfo('${settings.mainEnvName}-' + cluster, session);
+                if (resp.result == 0) { 
+                    for (var i = 0, k = resp.nodes; i < k.length; i++) { pgsqlIPs.push(k[i].address); }
+                }
+            }
+        }
+        glbs["pgsqlAddresses"] = pgsqlIPs;
+        return { result: 0, onAfterReturn: onAfterReturn };
+    - forEach(globals.pgsqlEnvs):
+        - if (${@i} != ${env.envName}):
+          - script: |-
+              var resp = jelastic.env.control.GetEnvInfo('${@i}' + cluster, session);
+              if (resp.result == 0) {
+                  var thisNodeIp, ipCmd = "ip a | grep -A1 venet0 | grep inet | awk '{print $2}'| sed 's|\/[0-9]*||g' | head -n 2|tail -n 1";
+                  resp = jelastic.env.control.ExecCmdByGroup('${@i}', session, "sqldb", toJSON([{ "command": ipCmd, "params": "" }]), false, false, "root");
+                  if (resp.result != 0) { return resp; } else { thisNodeIp = resp.responses[0].out; }
+                  var removeEnvCmd = "jcm updateHbaConf ${globals.nodes_address} ";
+                  resp = jelastic.env.control.ExecCmdByGroup('${@i}', session, "sqldb", toJSON([{ "command": removeEnvCmd, "params": thisNodeIp }]), false, false, "root");
+                  return resp;
+              }
+              return { result: 0 }
